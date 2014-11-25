@@ -216,6 +216,7 @@ def enforce_required_arguments(module):
 
 
 def get_properties(autoscaling_group):
+
     properties = dict((attr, getattr(autoscaling_group, attr)) for attr in ASG_ATTRIBUTES)
     properties['healthy_instances'] = 0
     properties['in_service_instances'] = 0
@@ -246,10 +247,53 @@ def get_properties(autoscaling_group):
         properties['instance_facts'] = instance_facts
     properties['load_balancers'] = autoscaling_group.load_balancers
 
-    if hasattr(autoscaling_group, "tags"):
+    if hasattr(autoscaling_group, "tags") and autoscaling_group.tags:
         properties['tags'] = dict((t.key, t.value) for t in autoscaling_group.tags)
 
     return properties
+
+
+def wait_for_elb(asg_connection, module, group_name):
+
+    region, ec2_url, aws_connect_params = get_aws_connection_info(module)
+    wait_timeout = module.params.get('wait_timeout')
+
+    logger("Wait for elb invoked")
+    # if the health_check_type is ELB, we want to query the ELBs directly for instance
+    # status as to avoid health_check_grace period that is awarded to ASG instances
+    as_group = asg_connection.get_all_groups(names=[group_name])[0]
+
+    if as_group.load_balancers and as_group.health_check_type == 'ELB':
+        logger("elb conditions met")
+        try:
+            elb_connection = connect_to_aws(boto.ec2.elb, region, **aws_connect_params)
+        except boto.exception.NoAuthHandlerFound, e:
+            module.fail_json(msg=str(e))
+        #start a timeout here waiting for instances to show up in ELB after being started in ASG
+        healthy_instances = {}
+        wait_timeout = time.time() + wait_timeout
+        
+        while len(healthy_instances.keys()) < as_group.min_size and wait_timeout > time.time():
+            as_group = asg_connection.get_all_groups(names=[group_name])[0]
+            props = get_properties(as_group)
+            instances = props["instances"]
+            logger("number of instances in asg == %s" % len(instances))
+            for lb in as_group.load_balancers:
+                lb_instances = elb_connection.describe_instance_health(lb, instances=instances)
+                logger("length of lb_instances is %s" % str(len(lb_instances)))
+                for i in lb_instances:
+                    if i.state == "InService":
+                        healthy_instances[i.instance_id] = i.state
+            logger("waiting for ELB, lb healthy %s  min size %s" % ( str(len(healthy_instances.keys())), as_group.min_size ) )
+            time.sleep(10)
+        if wait_timeout <= time.time():
+        # waiting took too long
+            module.fail_json(msg = "Waited too long for ELB instances to be healthy. %s" % time.asctime())
+
+
+
+    else:
+        logger("elb conditions NOT met")
 
 
 def create_autoscaling_group(connection, module):
@@ -377,7 +421,6 @@ def create_autoscaling_group(connection, module):
         except BotoServerError, e:
             module.fail_json(msg=str(e))
 
-
 def delete_autoscaling_group(connection, module):
     group_name = module.params.get('name')
     groups = connection.get_all_groups(names=[group_name])
@@ -408,7 +451,7 @@ def get_chunks(l, n):
         yield l[i:i+n]
 
 def replace(connection, module):
-
+    logger("replace function started.")
     batch_size = module.params.get('replace_batch_size')
     wait_timeout = module.params.get('wait_timeout')
     group_name = module.params.get('name')
@@ -417,20 +460,16 @@ def replace(connection, module):
     desired_capacity =  module.params.get('desired_capacity')
     replace_instances = module.params.get('replace_instances')
     
-    
     # wait for instance list to be populated on a newly provisioned ASG
     instance_wait = time.time() + 30
-    while instance_wait > time.time():
-        as_group = connection.get_all_groups(names=[group_name])[0]
-        props = get_properties(as_group)
-        if props.has_key('instances'):
-            instances = props['instances']
-            break
-        time.sleep(10)
-    if instance_wait <= time.time():
-        # waiting took too long
-        module.fail_json(msg = "Waited too long for instances to appear. %s" % time.asctime())
-    # determine if we need to continue
+    as_group = connection.get_all_groups(names=[group_name])[0]
+    logger("wait for instance list to be populated on a newly provisioned ASG")
+    wait_for_new_instances(connection, as_group, instance_wait, desired_capacity, 'viable_instances')
+    wait_for_elb(connection, module, group_name)
+
+    as_group = connection.get_all_groups(names=[group_name])[0]
+    props = get_properties(as_group)
+    instances = props['instances']
     replaceable = 0
     if replace_instances:
         instances = replace_instances
@@ -443,26 +482,27 @@ def replace(connection, module):
         return(changed, props)
         
     # set temporary settings and wait for them to be reached
+    as_group = connection.get_all_groups(names=[group_name])[0]
     as_group.max_size = max_size + batch_size
     as_group.min_size = min_size + batch_size
     as_group.desired_capacity = desired_capacity + batch_size
     as_group.update()
-    wait_timeout = time.time() + wait_timeout
-    while wait_timeout > time.time() and min_size + batch_size > props['viable_instances']:
-        time.sleep(10)
-        as_groups = connection.get_all_groups(names=[group_name])
-        as_group = as_groups[0]
-        props = get_properties(as_group)
-    if wait_timeout <= time.time():
-        # waiting took too long
-        module.fail_json(msg = "Waited too long for instances to appear. %s" % time.asctime())
+    logger("Wait for new temp instances")
+    wait_for_new_instances(connection, as_group, wait_timeout, as_group.min_size, 'viable_instances')
+    wait_for_elb(connection, module, as_group)
+    as_group = connection.get_all_groups(names=[group_name])[0]
+    props = get_properties(as_group)
     instances = props['instances']
     if replace_instances:
         instances = replace_instances
+    logger("Start replacing instances")
     for i in get_chunks(instances, batch_size):
-        replace_batch(connection, module, i)
+        logger("Replacing instance %s" % ' '.join(i))
+        terminate_batch(connection, module, i)
+        wait_for_new_instances(connection,  as_group, wait_timeout, as_group.min_size, 'viable_instances')
+        wait_for_elb(connection, module, group_name)
+        as_group = connection.get_all_groups(names=[group_name])[0]
     # return settings to normal
-    as_group = connection.get_all_groups(names=[group_name])[0]
     as_group.max_size = max_size 
     as_group.min_size = min_size 
     as_group.desired_capacity = desired_capacity
@@ -472,8 +512,7 @@ def replace(connection, module):
     changed=True
     return(changed, asg_properties)
 
-def replace_batch(connection, module, replace_instances):
-    
+def terminate_batch(connection, module, replace_instances):
     
     group_name = module.params.get('name')
     wait_timeout = int(module.params.get('wait_timeout'))
@@ -519,26 +558,34 @@ def replace_batch(connection, module, replace_instances):
         # waiting took too long
         module.fail_json(msg = "Waited too long for old instances to terminate. %s" % time.asctime())
 
+def wait_for_new_instances(connection, group_name, wait_timeout, desired_size, prop):
+
+    #group_name = module.params.get('name')
+    #wait_timeout = int(module.params.get('wait_timeout'))
+
     # make sure we have the latest stats after that last loop.
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
 
     # now we make sure that we have enough instances in a viable state
     wait_timeout = time.time() + wait_timeout
-    while wait_timeout > time.time() and props['min_size'] > props['viable_instances']:
+    while wait_timeout > time.time() and desired_size > props[prop]:
         time.sleep(10)
         as_groups = connection.get_all_groups(names=[group_name])
         as_group = as_groups[0]
         props = get_properties(as_group)
-
+        logger("Waiting for new instances %s %s" %( desired_size, props[prop]))
     if wait_timeout <= time.time():
         # waiting took too long
         module.fail_json(msg = "Waited too long for new instances to become viable. %s" % time.asctime())
 
-    # collect final stats info
-    as_group = connection.get_all_groups(names=[group_name])[0]
-    asg_properties = get_properties(as_group)
 
+    return props
+
+def logger(msg):
+    log = open('/tmp/blah.log', 'a')
+    log.write(msg + '\n')
+    log.close()
 
 
 def main():
@@ -569,7 +616,6 @@ def main():
         argument_spec=argument_spec, 
         mutually_exclusive = [['replace_all_instances', 'replace_instances']]
     )
-
     state = module.params.get('state')
     replace_instances = module.params.get('replace_instances')
     replace_all_instances = module.params.get('replace_all_instances')
@@ -581,7 +627,6 @@ def main():
     except boto.exception.NoAuthHandlerFound, e:
         module.fail_json(msg=str(e))
     changed = create_changed = replace_changed = False
-    
 
     if state == 'present':
         create_changed, asg_properties=create_autoscaling_group(connection, module)
@@ -593,5 +638,6 @@ def main():
     if create_changed or replace_changed:
         changed = True
     module.exit_json( changed = changed, **asg_properties )
+
 
 main()
