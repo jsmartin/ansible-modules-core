@@ -326,6 +326,8 @@ def create_autoscaling_group(connection, module):
         for attr in ASG_ATTRIBUTES:
             if module.params.get(attr):
                 module_attr = module.params.get(attr)
+                if attr == 'vpc_zone_identifier':
+                    module_attr = ','.join(module_attr)
                 group_attr = getattr(as_group, attr)
                 # we do this because AWS and the module may return the same list
                 # sorted differently
@@ -434,7 +436,7 @@ def replace(connection, module):
         time.sleep(10)
     if instance_wait <= time.time():
         # waiting took too long
-        module.fail_json(msg = "Waited too long for instances to appear. %s" % time.asctime())
+        module.fail_json(msg = "Waited too long for instances to appear, first check. %s" % time.asctime())
     # determine if we need to continue
     replaceable = 0
     if replace_instances:
@@ -460,7 +462,7 @@ def replace(connection, module):
         props = get_properties(as_group)
     if wait_timeout <= time.time():
         # waiting took too long
-        module.fail_json(msg = "Waited too long for instances to appear. %s" % time.asctime())
+        module.fail_json(msg = "Waited too long for instances to appear, second check. %s" % time.asctime())
     instances = props['instances']
     if replace_instances:
         instances = replace_instances
