@@ -191,9 +191,13 @@ to "replace_instances":
 
 import sys
 import time
+import logging as log
 
 from ansible.module_utils.basic import *
 from ansible.module_utils.ec2 import *
+log.getLogger('boto').setLevel(log.CRITICAL)
+#log.basicConfig(filename='/tmp/ansible_ec2_asg.log',level=log.DEBUG, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+
 
 try:
     import boto.ec2.autoscale
@@ -268,6 +272,28 @@ def get_properties(autoscaling_group):
 
     return properties
 
+def elb_healthy(asg_connection, elb_connection, module, group_name):
+    healthy_instances = {}
+    as_group = asg_connection.get_all_groups(names=[group_name])[0]
+    props = get_properties(as_group)
+    # get healthy, inservice instances from ASG
+    instances = []
+    for instance, settings in props['instance_facts'].items():
+        if settings['lifecycle_state'] == 'InService' and settings['health_status'] == 'Healthy':
+            instances.append(instance)
+    for lb in as_group.load_balancers:
+        # we catch a race condition that sometimes happens if the instance exists in the ASG
+        # but has not yet show up in the ELB
+        try:
+            lb_instances = elb_connection.describe_instance_health(lb, instances=instances)
+        except boto.exception.InvalidInstance, e:
+            pass
+        for i in lb_instances:
+            if i.state == "InService":
+                healthy_instances[i.instance_id] = i.state
+    return len(healthy_instances)
+
+
 
 def wait_for_elb(asg_connection, module, group_name):
     region, ec2_url, aws_connect_params = get_aws_connection_info(module)
@@ -278,36 +304,23 @@ def wait_for_elb(asg_connection, module, group_name):
     as_group = asg_connection.get_all_groups(names=[group_name])[0]
 
     if as_group.load_balancers and as_group.health_check_type == 'ELB':
+        log.debug("Waiting for ELB to consider intances healthy.")
         try:
             elb_connection = connect_to_aws(boto.ec2.elb, region, **aws_connect_params)
         except boto.exception.NoAuthHandlerFound, e:
             module.fail_json(msg=str(e))
 
         wait_timeout = time.time() + wait_timeout
-        healthy_instances = {}
+        healthy_instances = elb_healthy(asg_connection, elb_connection, module, group_name)
 
-        while len(healthy_instances.keys()) < as_group.min_size and wait_timeout > time.time():
-            as_group = asg_connection.get_all_groups(names=[group_name])[0]
-            props = get_properties(as_group)
-            # get healthy, inservice instances from ASG
-            instances = []
-            for instance, settings in props['instance_facts'].items():
-                if settings['lifecycle_state'] == 'InService' and settings['health_status'] == 'Healthy':
-                    instances.append(instance)
-            for lb in as_group.load_balancers:
-                # we catch a race condition that sometimes happens if the instance exists in the ASG
-                # but has not yet show up in the ELB
-                try:
-                    lb_instances = elb_connection.describe_instance_health(lb, instances=instances)
-                except boto.exception.InvalidInstance, e:
-                    pass
-                for i in lb_instances:
-                    if i.state == "InService":
-                        healthy_instances[i.instance_id] = i.state
+        while healthy_instances < as_group.min_size and wait_timeout > time.time():
+            healthy_instances = elb_healthy(asg_connection, elb_connection, module, group_name)
+            log.debug("ELB thinks {0} instances are healthy.".format(healthy_instances))
             time.sleep(10)
         if wait_timeout <= time.time():
         # waiting took too long
             module.fail_json(msg = "Waited too long for ELB instances to be healthy. %s" % time.asctime())
+        log.debug("Waiting complete.  ELB thinks {0} instances are healthy.".format(healthy_instances))
 
 def create_autoscaling_group(connection, module):
     group_name = module.params.get('name')
@@ -479,8 +492,9 @@ def replace(connection, module):
     max_size =  module.params.get('max_size')
     min_size =  module.params.get('min_size')
     desired_capacity =  module.params.get('desired_capacity')
+    lc_check = module.params.get('lc_check')
 
-    # FIXME: we need some more docs about this feature
+    
     replace_instances = module.params.get('replace_instances')
 
     as_group = connection.get_all_groups(names=[group_name])[0]
@@ -490,19 +504,41 @@ def replace(connection, module):
     replaceable = 0
     if replace_instances:
         instances = replace_instances
-    for k in props['instance_facts'].keys():
-        if k in instances:
-          if  props['instance_facts'][k]['launch_config_name'] != props['launch_config_name']:
-              replaceable += 1
+    # check to see if instances are replaceable if checking launch configs
+    if lc_check:
+        for k in props['instance_facts'].keys():
+            if k in instances:
+                if props['instance_facts'][k]['launch_config_name'] != props['launch_config_name']:
+                    replaceable += 1
+    # if we're not checking launch config, assume all are replaceable
+    else:
+        replaceable = 1
+
     if replaceable == 0:
         changed = False
         return(changed, props)
         
     # set temporary settings and wait for them to be reached
+    # This should get overriden if the number of instances left is less than the batch size.
+    starting_instances = list(props['instances'])
+ 
+    if lc_check:
+        new_instances = []
+        for i in props['instances']:
+            if props['instance_facts'][i]['launch_config_name']  == props['launch_config_name']:
+                new_instances.append(i)
+        num_new_inst_needed = desired_capacity - len(new_instances)
+
+        if num_new_inst_needed < batch_size:
+            log.debug("Overriding batch size")
+            batch_size = num_new_inst_needed
+
     as_group = connection.get_all_groups(names=[group_name])[0]
     as_group.max_size = max_size + batch_size
     as_group.min_size = min_size + batch_size
     as_group.desired_capacity = desired_capacity + batch_size
+    log.debug("setting temporary sizes")
+    log.debug("minimum size: {0}, desired_capacity: {1}, max size: {2}".format(min_size + batch_size, desired_capacity + batch_size, max_size + batch_size ))
     as_group.update()
     wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
     wait_for_elb(connection, module, group_name)
@@ -511,12 +547,21 @@ def replace(connection, module):
     instances = props['instances']
     if replace_instances:
         instances = replace_instances
+    log.debug("beginning main loop")
+    desired_size = as_group.min_size
     for i in get_chunks(instances, batch_size):
-        terminate_batch(connection, module, i)
-        wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
+        # break out of this loop if we have enough new instances
+        break_early=terminate_batch(connection, module, i, starting_instances)
+        if break_early:
+            log.debug("Overriding desired size to {0}".format(min_size))
+            desired_size = min_size
+        wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, 'viable_instances')
         wait_for_elb(connection, module, group_name)
         as_group = connection.get_all_groups(names=[group_name])[0]
-    # return settings to normal
+        if break_early:
+            log.debug("breaking loop")
+            break
+    log.debug("returning settings to normal")
     as_group.max_size = max_size 
     as_group.min_size = min_size 
     as_group.desired_capacity = desired_capacity
@@ -526,29 +571,84 @@ def replace(connection, module):
     changed=True
     return(changed, asg_properties)
 
-def terminate_batch(connection, module, replace_instances):
+def terminate_batch(connection, module, replace_instances, initial_old_instances):
+    batch_size = module.params.get('replace_batch_size')
+    min_size =  module.params.get('min_size')
+    desired_capacity =  module.params.get('desired_capacity')
     group_name = module.params.get('name')
     wait_timeout = int(module.params.get('wait_timeout'))
     lc_check = module.params.get('lc_check')
+    decrement_capacity = False
+    break_loop = False
 
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
 
-    # check to make sure instances given are actually in the given ASG
-    # and they have a non-current launch config
+    # need to get a list of all the new instances and all old instances
+    new_instances = []
+    all_old_instances = []
+
+
+    # old instances are those that have the old launch config
+    if lc_check:
+        for i in props['instances']:
+            if props['instance_facts'][i]['launch_config_name']  == props['launch_config_name']:
+                new_instances.append(i)
+            else:
+                all_old_instances.append(i)
+        
+    # comparing with initial old instances, since we are replacing regardless of launch config
+    else:
+        log.debug("Comparing initial instances with current: {0}".format(initial_old_instances))
+        for i in props['instances']:
+            if i not in initial_old_instances:
+                new_instances.append(i)
+                log.debug("Found new instance {0}".format(i))
+            else:
+                all_old_instances.append(i)
+                log.debug("Found old instance {0}".format(i))
+
+    num_new_inst_needed = desired_capacity - len(new_instances)
+
+
     old_instances = []
     instances = ( inst_id for inst_id in replace_instances if inst_id in props['instances'])
 
+    # check to make sure instances given are actually in the given ASG
+    # and they have a non-current launch config
     if lc_check:
         for i in instances:
            if props['instance_facts'][i]['launch_config_name']  != props['launch_config_name']:
                 old_instances.append(i)
     else:
-        old_instances = instances
+       for i in instances:
+            if i in initial_old_instances:
+                old_instances.append(i)
 
-    # set all instances given to unhealthy
+    
+    log.debug("new instances needed: {0}".format(num_new_inst_needed))
+    log.debug("new instances: {0}".format(new_instances))
+    log.debug("old instances: {0}".format(all_old_instances))
+    log.debug("batch instances: {0}".format(",".join(old_instances)))
+
+    if num_new_inst_needed == 0:
+        as_group.min_size = min_size
+        as_group.update()
+        log.debug("Updating minimum size back to original of {0}".format(min_size))
+        decrement_capacity = True
+        break_loop = True
+        old_instances = all_old_instances
+        log.debug("0 new instances needed")
+
+    if num_new_inst_needed < batch_size and num_new_inst_needed !=0 :
+        old_instances = old_instances[:num_new_inst_needed]
+        decrement_capacity = False
+        break_loop = False
+        log.debug("{0} new instances needed".format(num_new_inst_needed))
+
     for instance_id in old_instances:
-        connection.set_instance_health(instance_id,'Unhealthy')
+        log.debug("terminating instance: {0}".format(instance_id))
+        connection.terminate_instance(instance_id, decrement_capacity=decrement_capacity)
     
     # we wait to make sure the machines we marked as Unhealthy are
     # no longer in the list
@@ -556,36 +656,43 @@ def terminate_batch(connection, module, replace_instances):
     count = 1
     wait_timeout = time.time() + wait_timeout
     while wait_timeout > time.time() and count > 0:
+        log.debug("waiting for instances to terminate")
         count = 0
         as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
         instance_facts = props['instance_facts']
         instances = ( i for i in instance_facts if i in old_instances)
         for i in instances:
-            if  ( instance_facts[i]['lifecycle_state'] == 'Terminating'
-                 or instance_facts[i]['health_status'] == 'Unhealthy' ):
+            lifecycle = instance_facts[i]['lifecycle_state']
+            health = instance_facts[i]['health_status']
+            log.debug("Instance {0} has state of {1},{2}".format(i,lifecycle,health ))
+            if  lifecycle == 'Terminating' or healthy == 'Unhealthy':
                 count += 1
         time.sleep(10)
 
     if wait_timeout <= time.time():
         # waiting took too long
         module.fail_json(msg = "Waited too long for old instances to terminate. %s" % time.asctime())
+    log.debug("breaking loop: " + str(break_loop))
+    return break_loop
 
 def wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, prop):
 
+    log.debug("Waiting for {0}: {1}".format(prop, desired_size))
     # make sure we have the latest stats after that last loop.
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
     # now we make sure that we have enough instances in a viable state
     wait_timeout = time.time() + wait_timeout
     while wait_timeout > time.time() and desired_size > props[prop]:
+        log.debug("waiting for new instances to appear")
         time.sleep(10)
         as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
     if wait_timeout <= time.time():
         # waiting took too long
         module.fail_json(msg = "Waited too long for new instances to become viable. %s" % time.asctime())
-
+    log.debug("Reached {0}: {1}".format(prop, desired_size))
     return props
 
 def main():
