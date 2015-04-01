@@ -501,7 +501,8 @@ def replace(connection, module):
     wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
     props = get_properties(as_group)
     instances = props['instances']
-    replaceable = 0
+    old_instances = []
+    new_instances = []
     if replace_instances:
         instances = replace_instances
     # check to see if instances are replaceable if checking launch configs
@@ -509,30 +510,27 @@ def replace(connection, module):
         for k in props['instance_facts'].keys():
             if k in instances:
                 if props['instance_facts'][k]['launch_config_name'] != props['launch_config_name']:
-                    replaceable += 1
-    # if we're not checking launch config, assume all are replaceable
-    else:
-        replaceable = 1
+                    old_instances.append(k)
+                else:
+                    new_instances.append(k)
+        log.debug("Found these instances using the current launch config: {0} -- {1}".format(props['launch_config_name'], new_instances))
+        log.debug("Found these instances using an old launch config: {0}".format(old_instances))
 
-    if replaceable == 0:
+        num_new_inst_needed = desired_capacity - len(new_instances)
+
+        if num_new_inst_needed < batch_size:
+            log.debug("Overriding batch size to {0}".format(num_new_inst_needed))
+            batch_size = num_new_inst_needed
+    else:
+        old_instances = True
+
+    if not old_instances:
         changed = False
         return(changed, props)
         
     # set temporary settings and wait for them to be reached
     # This should get overriden if the number of instances left is less than the batch size.
     starting_instances = list(props['instances'])
- 
-    if lc_check:
-        new_instances = []
-        for i in props['instances']:
-            if props['instance_facts'][i]['launch_config_name']  == props['launch_config_name']:
-                new_instances.append(i)
-        num_new_inst_needed = desired_capacity - len(new_instances)
-
-        if num_new_inst_needed < batch_size:
-            log.debug("Overriding batch size")
-            batch_size = num_new_inst_needed
-
     as_group = connection.get_all_groups(names=[group_name])[0]
     as_group.max_size = max_size + batch_size
     as_group.min_size = min_size + batch_size
