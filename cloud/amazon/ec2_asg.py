@@ -196,7 +196,7 @@ import logging as log
 from ansible.module_utils.basic import *
 from ansible.module_utils.ec2 import *
 log.getLogger('boto').setLevel(log.CRITICAL)
-#log.basicConfig(filename='/tmp/ansible_ec2_asg.log',level=log.DEBUG, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+log.basicConfig(filename='/tmp/ansible_ec2_asg.log',level=log.DEBUG, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
 
 
 try:
@@ -556,13 +556,9 @@ def replace(connection, module):
     if replace_instances:
         instances = replace_instances
     log.debug("beginning main loop")
-    desired_size = as_group.min_size
     for i in get_chunks(instances, batch_size):
         # break out of this loop if we have enough new instances
-        break_early=terminate_batch(connection, module, i, starting_instances)
-        if break_early:
-            log.debug("Overriding min_size to {0}".format(min_size))
-            desired_size = min_size
+        break_early, desired_size = terminate_batch(connection, module, i, starting_instances)
         wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, 'viable_instances')
         wait_for_elb(connection, module, group_name)
         as_group = connection.get_all_groups(names=[group_name])[0]
@@ -588,9 +584,10 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
     lc_check = module.params.get('lc_check')
     decrement_capacity = False
     break_loop = False
-
+    
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
+    desired_size = as_group.min_size
 
     # need to get a list of all the new instances and all old instances
     new_instances = []
@@ -648,6 +645,7 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
             decrement_capacity = False
         break_loop = True
         instances_to_terminate = old_instances
+        desired_size = min_size
         log.debug("No new instances needed")
 
 
@@ -686,7 +684,7 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
         # waiting took too long
         module.fail_json(msg = "Waited too long for old instances to terminate. %s" % time.asctime())
     log.debug("breaking loop: " + str(break_loop))
-    return break_loop
+    return break_loop, desired_size
 
 def wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, prop):
 
