@@ -594,7 +594,7 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
 
     # need to get a list of all the new instances and all old instances
     new_instances = []
-    all_old_instances = []
+    old_instances = []
 
     # old instances are those that have the old launch config
     if lc_check:
@@ -602,7 +602,7 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
             if props['instance_facts'][i]['launch_config_name']  == props['launch_config_name']:
                 new_instances.append(i)
             else:
-                all_old_instances.append(i)
+                old_instances.append(i)
         
     # comparing with initial old instances, since we are replacing regardless of launch config
     else:
@@ -612,12 +612,12 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
                 new_instances.append(i)
                 log.debug("Found new instance {0}".format(i))
             else:
-                all_old_instances.append(i)
+                old_instances.append(i)
                 log.debug("Found old instance {0}".format(i))
 
     num_new_inst_needed = desired_capacity - len(new_instances)
 
-    old_instances = []
+    instances_to_terminate = []
     instances = ( inst_id for inst_id in replace_instances if inst_id in props['instances'])
 
     # check to make sure instances given are actually in the given ASG
@@ -625,16 +625,16 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
     if lc_check:
         for i in instances:
            if props['instance_facts'][i]['launch_config_name']  != props['launch_config_name']:
-                old_instances.append(i)
+                instances_to_terminate.append(i)
     else:
        for i in instances:
             if i in initial_old_instances:
-                old_instances.append(i)
+                instances_to_terminate.append(i)
 
     log.debug("new instances needed: {0}".format(num_new_inst_needed))
     log.debug("new instances: {0}".format(new_instances))
-    log.debug("old instances: {0}".format(all_old_instances))
-    log.debug("batch instances: {0}".format(",".join(old_instances)))
+    log.debug("old instances: {0}".format(old_instances))
+    log.debug("batch instances: {0}".format(",".join(instances_to_terminate)))
 
     if num_new_inst_needed == 0:
         decrement_capacity = True
@@ -647,17 +647,17 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
         if leftovers:
             decrement_capacity = False
         break_loop = True
-        old_instances = all_old_instances
+        instances_to_terminate = old_instances
         log.debug("No new instances needed")
 
 
     if num_new_inst_needed < batch_size and num_new_inst_needed !=0 :
-        old_instances = old_instances[:num_new_inst_needed]
+        instances_to_terminate = instances_to_terminate[:num_new_inst_needed]
         decrement_capacity = False
         break_loop = False
         log.debug("{0} new instances needed".format(num_new_inst_needed))
 
-    for instance_id in old_instances:
+    for instance_id in instances_to_terminate:
         log.debug("terminating instance: {0}".format(instance_id))
         connection.terminate_instance(instance_id, decrement_capacity=decrement_capacity)
     
@@ -673,7 +673,7 @@ def terminate_batch(connection, module, replace_instances, initial_old_instances
         as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
         instance_facts = props['instance_facts']
-        instances = ( i for i in instance_facts if i in old_instances)
+        instances = ( i for i in instance_facts if i in instances_to_terminate)
         for i in instances:
             lifecycle = instance_facts[i]['lifecycle_state']
             health = instance_facts[i]['health_status']
