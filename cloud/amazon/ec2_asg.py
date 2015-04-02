@@ -503,30 +503,9 @@ def replace(connection, module):
     wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
     props = get_properties(as_group)
     instances = props['instances']
-    old_instances = []
-    new_instances = []
-    if replace_instances:
-        instances = replace_instances
+
     # check to see if instances are replaceable if checking launch configs
     if lc_check:
-        for k in props['instance_facts'].keys():
-            if k in instances:
-                if props['instance_facts'][k]['launch_config_name'] != props['launch_config_name']:
-                    old_instances.append(k)
-                else:
-                    new_instances.append(k)
-        log.debug("Found these instances using the current launch config: {0} -- {1}".format(props['launch_config_name'], new_instances))
-        log.debug("Found these instances using an old launch config: {0}".format(old_instances))
-        num_new_inst_needed = desired_capacity - len(new_instances)
-        log.debug("new instances: {0}, old_intances: {1}, new instances needed: {2}".format(len(new_instances),len(old_instances),num_new_inst_needed))
-        # if we start out with enough new instances and have some old ones lingering, remove old ones
-        if num_new_inst_needed == 0 and old_instances:
-            terminate_batch(connection, module, old_instances, instances, True)
-            as_group = connection.get_all_groups(names=[group_name])[0]
-            props = get_properties(as_group)
-            changed = True
-            return(changed, props)
-
         # we don't want to spin up extra instances if not necessary
         if num_new_inst_needed < batch_size:
             log.debug("Overriding batch size to {0}".format(num_new_inst_needed))
@@ -552,19 +531,19 @@ def replace(connection, module):
     wait_for_elb(connection, module, group_name)
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-    instances = props['instances']
-    if replace_instances:
-        instances = replace_instances
+
     log.debug("beginning main loop")
-    for i in get_chunks(instances, batch_size):
-        # break out of this loop if we have enough new instances
-        break_early, desired_size = terminate_batch(connection, module, i, starting_instances)
+    while len(new_instances) < desired_capacity:
+        as_group.max_size = max_size - batch_size
+        as_group.min_size = min_size - batch_size
+        as_group.desired_capacity = desired_capacity - batch_size
+        wait for no instances terminating
+        as_group.max_size = max_size + batch_size
+        as_group.min_size = min_size + batch_size
+        as_group.desired_capacity = desired_capacity + batch_size
         wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, 'viable_instances')
         wait_for_elb(connection, module, group_name)
-        as_group = connection.get_all_groups(names=[group_name])[0]
-        if break_early:
-            log.debug("breaking loop")
-            break
+
     log.debug("returning settings to normal")
     as_group.max_size = max_size 
     as_group.min_size = min_size 
