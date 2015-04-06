@@ -270,7 +270,6 @@ def get_properties(autoscaling_group):
     if getattr(autoscaling_group, "tags", None):
         properties['tags'] = dict((t.key, t.value) for t in autoscaling_group.tags)
 
-
     return properties
 
 def elb_healthy(asg_connection, elb_connection, module, group_name):
@@ -382,7 +381,7 @@ def create_autoscaling_group(connection, module):
         try:
             connection.create_auto_scaling_group(ag)
             if wait_for_instances == True:
-                wait_for_new_instances(module, connection, group_name, wait_timeout, desired_capacity, 'viable_instances')
+                wait_for_inst(module, connection, group_name, wait_timeout, desired_capacity, 'viable_instances')
                 wait_for_elb(connection, module, group_name)
             as_group = connection.get_all_groups(names=[group_name])[0]
             asg_properties = get_properties(as_group)
@@ -448,7 +447,7 @@ def create_autoscaling_group(connection, module):
                 module.fail_json(msg=str(e))
 
         if wait_for_instances == True:
-            wait_for_new_instances(module, connection, group_name, wait_timeout, desired_capacity, 'viable_instances')
+            wait_for_inst(module, connection, group_name, wait_timeout, desired_capacity, 'viable_instances')
             wait_for_elb(connection, module, group_name)
         try:
             as_group = connection.get_all_groups(names=[group_name])[0]
@@ -486,7 +485,7 @@ def delete_autoscaling_group(connection, module):
         return changed
 
 
-def check_new_old_instances(lc_check, props):
+def check_instances_age(lc_check, props):
 
     old_instances = []
     new_instances = []
@@ -499,6 +498,13 @@ def check_new_old_instances(lc_check, props):
     log.debug("old: {0} new: {1} - checking launch config: {2}".format(old_instances, new_instances, lc_check))
     return old_instances, new_instances
 
+def update_size(group, max_size, min_size, dc):
+
+    group.max_size = max_size
+    group.min_size = min_size
+    group.desired_capacity = dc
+    group.update()
+
 def replace(connection, module):
     batch_size = module.params.get('replace_batch_size')
     wait_timeout = module.params.get('wait_timeout')
@@ -510,13 +516,10 @@ def replace(connection, module):
     replace_instances = module.params.get('replace_instances')
 
     as_group = connection.get_all_groups(names=[group_name])[0]
-    wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
+    wait_for_inst(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-    instances = props['instances']
-
-
-    old_instances, new_instances = check_new_old_instances(lc_check, props)
+    old_instances, new_instances = check_instances_age(lc_check, props)
     num_new_inst_needed = desired_capacity - len(new_instances)
     log.debug("new instances: {0}, old_intances: {1}, new instances needed: {2}".format(len(new_instances),len(old_instances),num_new_inst_needed))
 
@@ -536,65 +539,47 @@ def replace(connection, module):
     # This should get overriden if the number of instances left is less than the batch size.
 
     as_group = connection.get_all_groups(names=[group_name])[0]
-    as_group.max_size = max_size + batch_size
-    as_group.min_size = min_size + batch_size
-    as_group.desired_capacity = desired_capacity + batch_size
+    update_size(as_group, max_size + batch_size, min_size + batch_size, desired_capacity + batch_size)
     log.debug("setting temporary sizes")
     log.debug("minimum size: {0}, desired_capacity: {1}, max size: {2}".format(min_size + batch_size, desired_capacity + batch_size, max_size + batch_size ))
-    as_group.update()
-    wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
+    wait_for_inst(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
     wait_for_elb(connection, module, group_name)
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-
+    old_instances, new_instances = check_instances_age(lc_check, props)
     log.debug("beginning main loop")
     while len(new_instances) < desired_capacity:
-        as_group.max_size = max_size 
-        as_group.min_size = min_size 
-        as_group.desired_capacity = desired_capacity
-        as_group.update()
-        wait_for_dc(connection, wait_timeout, group_name, module)
-        as_group.max_size = max_size + batch_size
-        as_group.min_size = min_size + batch_size
-        as_group.desired_capacity = desired_capacity + batch_size
-        as_group.update()
-        wait_for_new_instances(module, connection, group_name, wait_timeout, desired_capacity + batch_size, 'viable_instances')
+        update_size(as_group, max_size, min_size, desired_capacity)
+        wait_for_term_inst(connection, wait_timeout, group_name, module)
+        update_size(as_group, max_size + batch_size, min_size + batch_size, desired_capacity + batch_size)
+        wait_for_inst(module, connection, group_name, wait_timeout, desired_capacity + batch_size, 'viable_instances')
         wait_for_elb(connection, module, group_name)
         as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
-        old_instances, new_instances = check_new_old_instances(lc_check, props)
+        old_instances, new_instances = check_instances_age(lc_check, props)
         log.debug("new instances: {0}, desired_capacity: {1}".format(len(new_instances), desired_capacity))
     log.debug("returning settings to normal")
-    as_group.max_size = max_size 
-    as_group.min_size = min_size 
-    as_group.desired_capacity = desired_capacity
-    as_group.update()
+    update_size(as_group, max_size, min_size, desired_capacity)
     as_group = connection.get_all_groups(names=[group_name])[0]
     asg_properties = get_properties(as_group)
     changed=True
     return(changed, asg_properties)
 
-def set_size(group, min_size, max_size, desired_capacity):
-        log.debug("Setting max: {0}, min: {1}, desired {2}".format(max_size + batch_size, min_size + batch_size, desired_capacity + batch_size))
-        group.max_size = max_size + batch_size
-        group.min_size = min_size + batch_size
-        group.desired_capacity = desired_capacity + batch_size
-        group.update()
 
-def wait_for_dc(connection, wait_timeout, group_name, module):
+def wait_for_term_inst(connection, wait_timeout, group_name, module):
 
     batch_size = module.params.get('replace_batch_size')
     lc_check = module.params.get('lc_check')
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-    old_inst_orig, new_instances_orig = check_new_old_instances(lc_check, props)
+    old_inst_orig, new_inst_orig = check_instances_age(lc_check, props)
     old_instances = old_inst_orig
+    new_instances = new_inst_orig
     wait_timeout = time.time() + wait_timeout
     while wait_timeout > time.time() and len(old_instances) != len(old_inst_orig) - batch_size:
-        log.debug("Old instances: {0}, Waiting for {1}".format(len(old_instances), len(old_inst_orig) - batch_size))
+        log.debug("Current old instances: {0}, Waiting for {1} to remain".format(len(old_instances), len(old_inst_orig) - batch_size))
         as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
-        log.debug("waiting for instances to terminate")
         instance_facts = props['instance_facts']
         instances = ( i for i in instance_facts )
 
@@ -602,11 +587,13 @@ def wait_for_dc(connection, wait_timeout, group_name, module):
             lifecycle = instance_facts[i]['lifecycle_state']
             health = instance_facts[i]['health_status']
             log.debug("Instance {0} has state of {1},{2}".format(i,lifecycle,health ))
-        old_instances, new_instances = check_new_old_instances(lc_check, props)
+        old_instances, new_instances = check_instances_age(lc_check, props)
         time.sleep(10)
+    else:
+        log.debug("Complete.  Current old instances: {0}".format(len(old_instances)))
 
 
-def wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, prop):
+def wait_for_inst(module, connection, group_name, wait_timeout, desired_size, prop):
     # wait until there are N more new instances
     # make sure we have the latest stats after that last loop.
     as_group = connection.get_all_groups(names=[group_name])[0]
