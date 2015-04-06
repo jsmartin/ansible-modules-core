@@ -530,7 +530,6 @@ def replace(connection, module):
             log.debug("Overriding batch size to {0}".format(num_new_inst_needed))
             batch_size = num_new_inst_needed
 
-
     if not old_instances:
         changed = False
         return(changed, props)
@@ -549,6 +548,10 @@ def replace(connection, module):
     old_instances, new_instances = check_instances_age(lc_check, props)
     log.debug("beginning main loop")
     while len(new_instances) < desired_capacity:
+        num_new_inst_needed = desired_capacity - len(new_instances)
+        if num_new_inst_needed < batch_size:
+            log.debug("Overriding batch size to {0}".format(num_new_inst_needed))
+            batch_size = num_new_inst_needed
         update_size(as_group, max_size, min_size, desired_capacity)
         wait_for_term_inst(connection, wait_timeout, group_name, module)
         update_size(as_group, max_size + batch_size, min_size + batch_size, desired_capacity + batch_size)
