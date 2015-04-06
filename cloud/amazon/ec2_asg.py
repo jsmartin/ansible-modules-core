@@ -485,9 +485,19 @@ def delete_autoscaling_group(connection, module):
         changed=False
         return changed
 
-def get_chunks(l, n):
-    for i in xrange(0, len(l), n):
-        yield l[i:i+n]
+
+def check_new_old_instances(lc_check, props):
+
+    old_instances = []
+    new_instances = []
+    if lc_check:
+        for i in props['instance_facts'].keys():
+                if props['instance_facts'][i]['launch_config_name'] != props['launch_config_name']:
+                    old_instances.append(i)
+                else:
+                    new_instances.append(i)
+    log.debug("old: {0} new: {1} - checking launch config: {2}".format(old_instances, new_instances, lc_check))
+    return old_instances, new_instances
 
 def replace(connection, module):
     batch_size = module.params.get('replace_batch_size')
@@ -501,8 +511,14 @@ def replace(connection, module):
 
     as_group = connection.get_all_groups(names=[group_name])[0]
     wait_for_new_instances(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
+    as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
     instances = props['instances']
+
+
+    old_instances, new_instances = check_new_old_instances(lc_check, props)
+    num_new_inst_needed = desired_capacity - len(new_instances)
+    log.debug("new instances: {0}, old_intances: {1}, new instances needed: {2}".format(len(new_instances),len(old_instances),num_new_inst_needed))
 
     # check to see if instances are replaceable if checking launch configs
     if lc_check:
@@ -510,8 +526,7 @@ def replace(connection, module):
         if num_new_inst_needed < batch_size:
             log.debug("Overriding batch size to {0}".format(num_new_inst_needed))
             batch_size = num_new_inst_needed
-    else:
-        old_instances = True
+
 
     if not old_instances:
         changed = False
@@ -519,7 +534,7 @@ def replace(connection, module):
         
     # set temporary settings and wait for them to be reached
     # This should get overriden if the number of instances left is less than the batch size.
-    starting_instances = list(props['instances'])
+
     as_group = connection.get_all_groups(names=[group_name])[0]
     as_group.max_size = max_size + batch_size
     as_group.min_size = min_size + batch_size
@@ -534,16 +549,21 @@ def replace(connection, module):
 
     log.debug("beginning main loop")
     while len(new_instances) < desired_capacity:
-        as_group.max_size = max_size - batch_size
-        as_group.min_size = min_size - batch_size
-        as_group.desired_capacity = desired_capacity - batch_size
-        wait for no instances terminating
+        as_group.max_size = max_size 
+        as_group.min_size = min_size 
+        as_group.desired_capacity = desired_capacity
+        as_group.update()
+        wait_for_dc(connection, wait_timeout, group_name, module)
         as_group.max_size = max_size + batch_size
         as_group.min_size = min_size + batch_size
         as_group.desired_capacity = desired_capacity + batch_size
-        wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, 'viable_instances')
+        as_group.update()
+        wait_for_new_instances(module, connection, group_name, wait_timeout, desired_capacity + batch_size, 'viable_instances')
         wait_for_elb(connection, module, group_name)
-
+        as_group = connection.get_all_groups(names=[group_name])[0]
+        props = get_properties(as_group)
+        old_instances, new_instances = check_new_old_instances(lc_check, props)
+        log.debug("new instances: {0}, desired_capacity: {1}".format(len(new_instances), desired_capacity))
     log.debug("returning settings to normal")
     as_group.max_size = max_size 
     as_group.min_size = min_size 
@@ -554,119 +574,40 @@ def replace(connection, module):
     changed=True
     return(changed, asg_properties)
 
-def terminate_batch(connection, module, replace_instances, initial_old_instances, leftovers=False):
+def set_size(group, min_size, max_size, desired_capacity):
+        log.debug("Setting max: {0}, min: {1}, desired {2}".format(max_size + batch_size, min_size + batch_size, desired_capacity + batch_size))
+        group.max_size = max_size + batch_size
+        group.min_size = min_size + batch_size
+        group.desired_capacity = desired_capacity + batch_size
+        group.update()
+
+def wait_for_dc(connection, wait_timeout, group_name, module):
+
     batch_size = module.params.get('replace_batch_size')
-    min_size =  module.params.get('min_size')
-    desired_capacity =  module.params.get('desired_capacity')
-    group_name = module.params.get('name')
-    wait_timeout = int(module.params.get('wait_timeout'))
     lc_check = module.params.get('lc_check')
-    decrement_capacity = False
-    break_loop = False
-    
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-    desired_size = as_group.min_size
-
-    # need to get a list of all the new instances and all old instances
-    new_instances = []
-    old_instances = []
-
-    # old instances are those that have the old launch config
-    if lc_check:
-        for i in props['instances']:
-            if props['instance_facts'][i]['launch_config_name']  == props['launch_config_name']:
-                new_instances.append(i)
-            else:
-                old_instances.append(i)
-        
-    # comparing with initial old instances, since we are replacing regardless of launch config
-    else:
-        log.debug("Comparing initial instances with current: {0}".format(initial_old_instances))
-        for i in props['instances']:
-            if i not in initial_old_instances:
-                new_instances.append(i)
-                log.debug("Found new instance {0}".format(i))
-            else:
-                old_instances.append(i)
-                log.debug("Found old instance {0}".format(i))
-
-    num_new_inst_needed = desired_capacity - len(new_instances)
-
-    instances_to_terminate = []
-    instances = ( inst_id for inst_id in replace_instances if inst_id in props['instances'])
-
-    # check to make sure instances given are actually in the given ASG
-    # and they have a non-current launch config
-    if lc_check:
-        for i in instances:
-           if props['instance_facts'][i]['launch_config_name']  != props['launch_config_name']:
-                instances_to_terminate.append(i)
-    else:
-       for i in instances:
-            if i in initial_old_instances:
-                instances_to_terminate.append(i)
-
-    log.debug("new instances needed: {0}".format(num_new_inst_needed))
-    log.debug("new instances: {0}".format(new_instances))
-    log.debug("old instances: {0}".format(old_instances))
-    log.debug("batch instances: {0}".format(",".join(instances_to_terminate)))
-
-    if num_new_inst_needed == 0:
-        decrement_capacity = True
-        if as_group.min_size != min_size:
-            as_group.min_size = min_size
-            as_group.update()
-            log.debug("Updating minimum size back to original of {0}".format(min_size))
-        #if are some leftover old instances, but we are already at capacity with new ones
-        # we don't want to decrement capacity
-        if leftovers:
-            decrement_capacity = False
-        break_loop = True
-        instances_to_terminate = old_instances
-        desired_size = min_size
-        log.debug("No new instances needed")
-
-
-    if num_new_inst_needed < batch_size and num_new_inst_needed !=0 :
-        instances_to_terminate = instances_to_terminate[:num_new_inst_needed]
-        decrement_capacity = False
-        break_loop = False
-        log.debug("{0} new instances needed".format(num_new_inst_needed))
-
-    for instance_id in instances_to_terminate:
-        log.debug("terminating instance: {0}".format(instance_id))
-        connection.terminate_instance(instance_id, decrement_capacity=decrement_capacity)
-    
-    # we wait to make sure the machines we marked as Unhealthy are
-    # no longer in the list
-
-    count = 1
+    old_inst_orig, new_instances_orig = check_new_old_instances(lc_check, props)
+    old_instances = old_inst_orig
     wait_timeout = time.time() + wait_timeout
-    log.debug("decrementing capacity: {0}".format(decrement_capacity))
-    while wait_timeout > time.time() and count > 0:
-        log.debug("waiting for instances to terminate")
-        count = 0
+    while wait_timeout > time.time() and len(old_instances) != len(old_inst_orig) - batch_size:
+        log.debug("Old instances: {0}, Waiting for {1}".format(len(old_instances), len(old_inst_orig) - batch_size))
         as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
+        log.debug("waiting for instances to terminate")
         instance_facts = props['instance_facts']
-        instances = ( i for i in instance_facts if i in instances_to_terminate)
+        instances = ( i for i in instance_facts )
+
         for i in instances:
             lifecycle = instance_facts[i]['lifecycle_state']
             health = instance_facts[i]['health_status']
             log.debug("Instance {0} has state of {1},{2}".format(i,lifecycle,health ))
-            if  lifecycle == 'Terminating' or healthy == 'Unhealthy':
-                count += 1
+        old_instances, new_instances = check_new_old_instances(lc_check, props)
         time.sleep(10)
 
-    if wait_timeout <= time.time():
-        # waiting took too long
-        module.fail_json(msg = "Waited too long for old instances to terminate. %s" % time.asctime())
-    log.debug("breaking loop: " + str(break_loop))
-    return break_loop, desired_size
 
 def wait_for_new_instances(module, connection, group_name, wait_timeout, desired_size, prop):
-
+    # wait until there are N more new instances
     # make sure we have the latest stats after that last loop.
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
