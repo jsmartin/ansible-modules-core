@@ -307,7 +307,7 @@ def wait_for_elb(asg_connection, module, group_name):
     as_group = asg_connection.get_all_groups(names=[group_name])[0]
 
     if as_group.load_balancers and as_group.health_check_type == 'ELB':
-        log.debug("Waiting for ELB to consider intances healthy.")
+        log.debug("Waiting for ELB to consider instances healthy.")
         try:
             elb_connection = connect_to_aws(boto.ec2.elb, region, **aws_connect_params)
         except boto.exception.NoAuthHandlerFound, e:
@@ -485,16 +485,27 @@ def delete_autoscaling_group(connection, module):
         return changed
 
 
-def check_instances_age(lc_check, props):
+def get_instances_by_age(lc_check, props, initial_instances=[]):
 
     old_instances = []
     new_instances = []
     if lc_check:
         for i in props['instance_facts'].keys():
-                if props['instance_facts'][i]['launch_config_name'] != props['launch_config_name']:
+            if props['instance_facts'][i]['launch_config_name'] != props['launch_config_name']:
+                old_instances.append(i)
+            else:
+                new_instances.append(i)
+    else:
+        if initial_instances:
+            for i in props['instance_facts'].keys():
+                if i in initial_instances:
                     old_instances.append(i)
                 else:
                     new_instances.append(i)
+        else:
+            for i in props['instance_facts'].keys():
+                    old_instances.append(i)
+
     log.debug("old: {0} new: {1} - checking launch config: {2}".format(old_instances, new_instances, lc_check))
     return old_instances, new_instances
 
@@ -519,17 +530,24 @@ def replace(connection, module):
     wait_for_inst(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-    old_instances, new_instances = check_instances_age(lc_check, props)
+    old_instances, new_instances = get_instances_by_age(lc_check, props)
     num_new_inst_needed = desired_capacity - len(new_instances)
-    log.debug("new instances: {0}, old_intances: {1}, new instances needed: {2}".format(len(new_instances),len(old_instances),num_new_inst_needed))
 
+    orig_term_policy = as_group.termination_policies
     # check to see if instances are replaceable if checking launch configs
     if lc_check:
         # we don't want to spin up extra instances if not necessary
         if num_new_inst_needed < batch_size:
             log.debug("Overriding batch size to {0}".format(num_new_inst_needed))
             batch_size = num_new_inst_needed
+        as_group.termination_policies = ['Default']
+    else:
+        as_group.termination_policies = ['OldestInstance']
+    log.debug("Setting termination policy to {0}".format(as_group.termination_policies))
+    as_group.update()
+    orig_old_instances = old_instances
 
+    
     if not old_instances:
         changed = False
         return(changed, props)
@@ -545,7 +563,7 @@ def replace(connection, module):
     wait_for_elb(connection, module, group_name)
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-    old_instances, new_instances = check_instances_age(lc_check, props)
+    old_instances, new_instances = get_instances_by_age(lc_check, props, orig_old_instances)
     log.debug("beginning main loop")
     while len(new_instances) < desired_capacity:
         num_new_inst_needed = desired_capacity - len(new_instances)
@@ -553,29 +571,32 @@ def replace(connection, module):
             log.debug("Overriding batch size to {0}".format(num_new_inst_needed))
             batch_size = num_new_inst_needed
         update_size(as_group, max_size, min_size, desired_capacity)
-        wait_for_term_inst(connection, wait_timeout, group_name, module)
+        wait_for_term_inst(connection, wait_timeout, group_name, module, orig_old_instances)
         update_size(as_group, max_size + batch_size, min_size + batch_size, desired_capacity + batch_size)
         wait_for_inst(module, connection, group_name, wait_timeout, desired_capacity + batch_size, 'viable_instances')
         wait_for_elb(connection, module, group_name)
         as_group = connection.get_all_groups(names=[group_name])[0]
         props = get_properties(as_group)
-        old_instances, new_instances = check_instances_age(lc_check, props)
+        old_instances, new_instances = get_instances_by_age(lc_check, props, orig_old_instances)
         log.debug("new instances: {0}, desired_capacity: {1}".format(len(new_instances), desired_capacity))
     log.debug("returning settings to normal")
     update_size(as_group, max_size, min_size, desired_capacity)
+    as_group.termination_policies = orig_term_policy
+    log.debug("Setting termination policy to {0}".format(as_group.termination_policies))
+    as_group.update()
     as_group = connection.get_all_groups(names=[group_name])[0]
     asg_properties = get_properties(as_group)
     changed=True
     return(changed, asg_properties)
 
 
-def wait_for_term_inst(connection, wait_timeout, group_name, module):
+def wait_for_term_inst(connection, wait_timeout, group_name, module, orig_old_instances):
 
     batch_size = module.params.get('replace_batch_size')
     lc_check = module.params.get('lc_check')
     as_group = connection.get_all_groups(names=[group_name])[0]
     props = get_properties(as_group)
-    old_inst_orig, new_inst_orig = check_instances_age(lc_check, props)
+    old_inst_orig, new_inst_orig = get_instances_by_age(lc_check, props, orig_old_instances)
     old_instances = old_inst_orig
     new_instances = new_inst_orig
     wait_timeout = time.time() + wait_timeout
@@ -590,7 +611,7 @@ def wait_for_term_inst(connection, wait_timeout, group_name, module):
             lifecycle = instance_facts[i]['lifecycle_state']
             health = instance_facts[i]['health_status']
             log.debug("Instance {0} has state of {1},{2}".format(i,lifecycle,health ))
-        old_instances, new_instances = check_instances_age(lc_check, props)
+        old_instances, new_instances = get_instances_by_age(lc_check, props, orig_old_instances)
         time.sleep(10)
     else:
         log.debug("Complete.  Current old instances: {0}".format(len(old_instances)))
