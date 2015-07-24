@@ -129,6 +129,13 @@ options:
         "Content-Type" along with your request with a value of "application/json".
     required: false
     default: null
+  headers:
+    description:
+      - A dictionary of headers you wish to pass to the URI.  This can compliment or be
+        used in place of the HEADER_ method.
+    required: false
+    default: null
+    version_added: "2.0"
   others:
     description:
       - all arguments accepted by the M(file) module also work here
@@ -187,6 +194,26 @@ EXAMPLES = '''
     method: GET
     return_content: yes
     HEADER_Cookie: "{{login.set_cookie}}"
+
+
+# Login to a form based webpage, then use the returned cookie to
+# access the app in later tasks, using headers dictionary.
+
+- uri:
+    url: https://your.form.based.auth.examle.com/index.php 
+    method: POST
+    body: "name=your_username&password=your_password&enter=Sign%20in" 
+    status_code: 302
+    headers: 
+        Content-Type: "application/x-www-form-urlencoded"
+  register: login
+
+- uri:
+    url: https://your.form.based.auth.example.com/dashboard.php
+    method: GET
+    return_content: yes
+    headers:
+        Cookie: "{{login.set_cookie}}"
 
 # Queue build of a project in Jenkins:
 - uri:
@@ -368,6 +395,7 @@ def main():
             password = dict(required=False, default=None),
             body = dict(required=False, default=None),
             body_format = dict(required=False, default='raw', choices=['raw', 'json']),
+            headers = dict(required=False, default={}, type='dict'),
             method = dict(required=False, default='GET', choices=['GET', 'POST', 'PUT', 'HEAD', 'DELETE', 'OPTIONS', 'PATCH', 'TRACE', 'CONNECT', 'REFRESH']),
             return_content = dict(required=False, default='no', type='bool'),
             force_basic_auth = dict(required=False, default='no', type='bool'),
@@ -394,6 +422,7 @@ def main():
     body_format = module.params['body_format']
     method = module.params['method']
     dest = module.params['dest']
+    dict_headers = module.params['headers']
     return_content = module.params['return_content']
     force_basic_auth = module.params['force_basic_auth']
     redirects = module.params['follow_redirects']
@@ -402,8 +431,6 @@ def main():
     status_code = [int(x) for x in list(module.params['status_code'])]
     socket_timeout = module.params['timeout']
     validate_certs = module.params['validate_certs']
-
-    dict_headers = {}
 
     # If body_format is json, encodes the body (wich can be a dict or a list) and automatically sets the Content-Type header
     if body_format == 'json':
